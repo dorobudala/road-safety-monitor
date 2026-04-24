@@ -1,0 +1,9 @@
+flask
+flask-cors
+ultralytics
+opencv-python-headless
+numpy
+torch
+easyocr
+scikit-learn
+Pillow
