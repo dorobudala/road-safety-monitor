@@ -88,15 +88,17 @@ class FrameBuffer:
     Thread-safe rolling buffer that stores the last N raw frames.
     Used to retrieve frames just before a violation was detected.
     """
-    def __init__(self, maxlen=BURST_BEFORE + 1):
+    def __init__(self, maxlen=None):
+        if maxlen is None:
+            maxlen = BURST_BEFORE + 1
         self._buf = deque(maxlen=maxlen)
         self._lock = threading.Lock()
 
-    def push(self, frame: np.ndarray):
+    def push(self, frame):
         with self._lock:
             self._buf.append(frame.copy())
 
-    def get_recent(self, n: int) -> list:
+    def get_recent(self, n):
         """Return up to n most-recent frames (oldest first)."""
         with self._lock:
             frames = list(self._buf)
@@ -112,10 +114,9 @@ frame_buffers = {
 # ─────────────────────────────────────────────
 # PENDING BURST CAPTURES
 # ─────────────────────────────────────────────
-# When a violation fires we immediately save the buffered frames (before + current),
-# then schedule the "after" frames to be saved as they arrive.
-#
-# pending_bursts[cam_id] is a list of active BurstCapture objects.
+pending_bursts = {"CAM-1": [], "CAM-2": []}
+pending_bursts_lock = threading.Lock()
+
 
 class BurstCapture:
     """Manages saving of all 5 frames for a single violation event."""
@@ -141,30 +142,23 @@ class BurstCapture:
         self.folder_path = os.path.join(SNAPSHOT_DIR, self.folder_name)
         os.makedirs(self.folder_path, exist_ok=True)
 
-        self.saved_count  = 0          # how many frames saved so far
-        self.after_needed = BURST_AFTER  # how many "after" frames still needed
+        self.saved_count  = 0
+        self.after_needed = BURST_AFTER
         self.filenames    = []
 
         # Save pre-violation + current frames immediately
         for frame in pre_frames:
             self._save_frame(frame)
 
-    def feed_after_frame(self, frame: np.ndarray) -> bool:
-        """
-        Call with each new raw frame after the violation.
-        Returns True when all 5 frames have been saved.
-        """
+    def feed_after_frame(self, frame):
         if self.after_needed <= 0:
             return True
         self._save_frame(frame)
         self.after_needed -= 1
         return self.after_needed == 0
 
-    def _save_frame(self, raw_frame: np.ndarray):
-        """Crop, annotate, and save a single frame."""
+    def _save_frame(self, raw_frame):
         h, w = raw_frame.shape[:2]
-
-        # Crop with margin
         margin  = SNAPSHOT_MARGIN
         cx1     = max(0, self.x1 - margin)
         cy1     = max(0, self.y1 - margin)
@@ -175,7 +169,6 @@ class BurstCapture:
         if roi.size == 0:
             roi = raw_frame.copy()
 
-        # Up-scale if too small
         rh, rw = roi.shape[:2]
         if rw < SNAPSHOT_MIN_WIDTH or rh < SNAPSHOT_MIN_HEIGHT:
             scale_w = max(SNAPSHOT_MIN_WIDTH / max(rw, 1), 1.2)
@@ -192,8 +185,7 @@ class BurstCapture:
         self.filenames.append(fname)
         self.saved_count += 1
 
-    def _annotate(self, img: np.ndarray) -> np.ndarray:
-        """Draw information overlay on a snapshot image."""
+    def _annotate(self, img):
         color_map_for_bar = {
             "RED": (0, 0, 255), "BLUE": (255, 0, 0), "GREEN": (0, 255, 0),
             "YELLOW": (0, 255, 255), "BLACK": (0, 0, 0), "WHITE": (255, 255, 255),
@@ -206,13 +198,11 @@ class BurstCapture:
         bar_color = color_map_for_bar.get(self.car_color, (100, 100, 100))
         h_img, w_img = img.shape[:2]
 
-        # Dark header bar
         bar_h   = 130
         overlay = img.copy()
         cv2.rectangle(overlay, (0, 0), (w_img, bar_h), (0, 0, 0), -1)
         img = cv2.addWeighted(overlay, 0.6, img, 0.4, 0)
 
-        # Color strip on left edge
         cv2.rectangle(img, (0, 0), (15, h_img), bar_color, -1)
 
         font  = cv2.FONT_HERSHEY_SIMPLEX
@@ -224,20 +214,17 @@ class BurstCapture:
         cv2.putText(img, f"TYPE:  {self.vehicle_type.upper()}",(25,  78), font, fscl, (255, 255, 255),  thick)
         cv2.putText(img, f"VIOLATION: {self.violation.replace('_',' ')}", (25, 103), font, 0.6, (0, 165, 255), 2)
 
-        # Frame counter
         frame_label = f"FRAME {self.saved_count + 1}/{BURST_TOTAL}"
         cv2.putText(img, frame_label, (25, 128), font, 0.55, (200, 200, 0), 2)
 
-        # Timestamp bottom-right
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         (tw, _), _ = cv2.getTextSize(ts_str, font, 0.5, 1)
         cv2.putText(img, ts_str, (w_img - tw - 10, h_img - 10), font, 0.5, (200, 200, 200), 1)
 
-        # Border
         cv2.rectangle(img, (0, 0), (w_img - 1, h_img - 1), (0, 255, 255), 3)
         return img
 
-    def metadata(self) -> dict:
+    def metadata(self):
         return {
             "folder":       self.folder_name,
             "timestamp":    datetime.now().isoformat(),
@@ -253,16 +240,11 @@ class BurstCapture:
         }
 
 
-# Active bursts per camera  { cam_id: [BurstCapture, ...] }
-pending_bursts: dict[str, list] = {"CAM-1": [], "CAM-2": []}
-pending_bursts_lock = threading.Lock()
-
-
 # ─────────────────────────────────────────────
 # CAR COLOR DETECTION (with caching)
 # ─────────────────────────────────────────────
 color_cache = {}
-COLOR_CACHE_TTL = 3.0  # seconds
+COLOR_CACHE_TTL = 3.0
 
 
 def detect_car_color(vehicle_image):
@@ -304,29 +286,6 @@ def detect_car_color(vehicle_image):
         if score > best_score:
             best_score = score
             best_match = color_name
-
-    if best_score < 0.15 and SKLEARN_AVAILABLE:
-        try:
-            pixels = vehicle_image.reshape(-1, 3)
-            if len(pixels) > 5000:
-                idx    = np.random.choice(len(pixels), 5000, replace=False)
-                pixels = pixels[idx]
-            kmeans       = KMeans(n_clusters=3, random_state=42, n_init=10)
-            kmeans.fit(pixels)
-            dom_bgr      = kmeans.cluster_centers_[np.argmax(np.bincount(kmeans.labels_))]
-            dom_hsv      = cv2.cvtColor(np.uint8([[dom_bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-            for color_name, ranges in color_ranges.items():
-                if len(ranges) == 4:
-                    if (ranges[0][0] <= dom_hsv[0] <= ranges[1][0] or
-                            ranges[2][0] <= dom_hsv[0] <= ranges[3][0]):
-                        best_match = color_name
-                        break
-                else:
-                    if ranges[0][0] <= dom_hsv[0] <= ranges[1][0]:
-                        best_match = color_name
-                        break
-        except Exception:
-            pass
 
     if best_match == "UNKNOWN" or best_score < 0.1:
         r, g, b = np.mean(vehicle_image, axis=(0, 1))[[2, 1, 0]]
@@ -438,22 +397,15 @@ def serve_snapshot(filename):
 # ─────────────────────────────────────────────
 def trigger_burst_snapshot(frame, x1, y1, x2, y2, cam_id, plate, violation,
                             confidence, vehicle_type, vehicle_id):
-    """
-    Start a 5-frame burst capture for a violation.
-    Returns the folder name (used as the snapshot reference in the log).
-    """
     h, w = frame.shape[:2]
-
-    # Detect color from current frame
     margin   = SNAPSHOT_MARGIN
     cx1, cy1 = max(0, x1 - margin), max(0, y1 - margin)
     cx2, cy2 = min(w, x2 + margin), min(h, y2 + margin)
     roi      = frame[cy1:cy2, cx1:cx2]
     car_color = get_cached_color(vehicle_id, roi) if roi.size > 0 else "UNKNOWN"
 
-    # Retrieve buffered pre-violation frames (up to BURST_BEFORE) + current
     pre_frames = frame_buffers[cam_id].get_recent(BURST_BEFORE)
-    pre_frames.append(frame)  # current frame = violation frame
+    pre_frames.append(frame)
 
     burst = BurstCapture(
         cam_id=cam_id, plate=plate, violation=violation,
@@ -466,17 +418,13 @@ def trigger_burst_snapshot(frame, x1, y1, x2, y2, cam_id, plate, violation,
     with pending_bursts_lock:
         pending_bursts[cam_id].append(burst)
 
-    print(f"[{cam_id}] 📸 BURST started ({BURST_TOTAL} frames) | "
+    print(f"[{cam_id}] BURST started ({BURST_TOTAL} frames) | "
           f"{car_color} {vehicle_type} | Plate: {plate} | {violation}")
 
     return burst.folder_name
 
 
-def feed_pending_bursts(cam_id: str, raw_frame: np.ndarray):
-    """
-    Call once per raw frame. Feeds waiting bursts with after-frames.
-    Completed bursts are finalised and removed.
-    """
+def feed_pending_bursts(cam_id, raw_frame):
     completed = []
     with pending_bursts_lock:
         active = list(pending_bursts[cam_id])
@@ -486,7 +434,6 @@ def feed_pending_bursts(cam_id: str, raw_frame: np.ndarray):
         if done:
             completed.append(burst)
 
-    # Finalise completed bursts
     for burst in completed:
         with pending_bursts_lock:
             try:
@@ -494,12 +441,11 @@ def feed_pending_bursts(cam_id: str, raw_frame: np.ndarray):
             except ValueError:
                 pass
         _save_burst_metadata(burst)
-        print(f"[{burst.cam_id}] ✅ BURST complete: {burst.folder_name} "
+        print(f"[{burst.cam_id}] BURST complete: {burst.folder_name} "
               f"({burst.saved_count} frames saved)")
 
 
-def _save_burst_metadata(burst: BurstCapture):
-    """Append burst metadata to the JSON file."""
+def _save_burst_metadata(burst):
     meta = burst.metadata()
     try:
         if os.path.exists(METADATA_FILE):
@@ -674,7 +620,6 @@ def detect_violations(detections, cam_id, frame):
                 if do_scheduled_ocr or force_ocr:
                     plate = read_plate(frame, x1, y1, x2, y2)
 
-            # ── BURST SNAPSHOT (5 frames) ──
             snap_folder = ""
             if cls_id in SNAPSHOT_CLASSES:
                 vehicle_id  = f"{cam_id}_{tid}"
@@ -691,10 +636,10 @@ def detect_violations(detections, cam_id, frame):
                     "vehicle_class": label,
                     "violation":     violation.replace("_", " "),
                     "probability":   f"{int(conf*100)}%",
-                    "snapshot":      snap_folder,   # folder name (contains 5 frames)
+                    "snapshot":      snap_folder,
                     "burst_frames":  BURST_TOTAL,
                 })
-                print(f"[{cam_id}] 🚨 {violation} - {plate}")
+                print(f"[{cam_id}] {violation} - {plate}")
 
     return events
 
@@ -740,10 +685,7 @@ def draw_detections(frame, detections, cam_id):
 # PROCESS FRAME
 # ─────────────────────────────────────────────
 def process_frame(frame, cam_id):
-    # Push raw frame into buffer BEFORE detection (for pre-violation frames)
     frame_buffers[cam_id].push(frame)
-
-    # Feed any pending after-frames for this camera
     feed_pending_bursts(cam_id, frame)
 
     results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
@@ -867,8 +809,10 @@ def fetch_esp32_stream(cam_id, url):
             time.sleep(reconnect_delay)
         finally:
             if stream:
-                try: stream.close()
-                except Exception: pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
     connected[cam_id] = False
     print(f"[{cam_id}] Stopped")
@@ -950,7 +894,6 @@ def clear_log():
 
 @app.route("/api/snapshots")
 def list_snapshots():
-    """List all burst folders (each = one violation event)."""
     try:
         entries = sorted(os.listdir(SNAPSHOT_DIR), reverse=True)
         folders = [e for e in entries
@@ -962,7 +905,6 @@ def list_snapshots():
 
 @app.route("/api/snapshots/<folder>")
 def list_burst_frames(folder):
-    """List the individual frame files inside a burst folder."""
     folder_path = os.path.join(SNAPSHOT_DIR, folder)
     if not os.path.isdir(folder_path):
         return jsonify({"error": "Not found"}), 404
@@ -1019,22 +961,20 @@ def scan():
 # RUN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    import os as _os
+    port = int(_os.environ.get("PORT", 10000))
     print("=" * 60)
     print("ROAD SAFETY MONITOR - 5-FRAME BURST CAPTURE ON VIOLATION")
     print("=" * 60)
-    print(f"[INFO] Server:          http://localhost:5000")
-    print(f"[INFO] Snapshots dir:   ./{SNAPSHOT_DIR}/")
-    print(f"[INFO] Metadata file:   {METADATA_FILE}")
-    print(f"[INFO] Device:          {DEVICE.upper()}")
-    print(f"[INFO] Burst frames:    {BURST_BEFORE} before + 1 current + {BURST_AFTER} after = {BURST_TOTAL}")
+    print(f"[INFO] Server: http://0.0.0.0:{port}")
+    print(f"[INFO] Snapshots dir: ./{SNAPSHOT_DIR}/")
+    print(f"[INFO] Metadata file: {METADATA_FILE}")
+    print(f"[INFO] Device: {DEVICE.upper()}")
+    print(f"[INFO] Burst frames: {BURST_BEFORE} before + 1 current + {BURST_AFTER} after = {BURST_TOTAL}")
     print(f"[INFO] Color Detection: {'ENABLED' if SKLEARN_AVAILABLE else 'LIMITED'}")
-    print(f"[INFO] OCR:             {'ENABLED' if OCR_AVAILABLE else 'DISABLED'}")
+    print(f"[INFO] OCR: {'ENABLED' if OCR_AVAILABLE else 'DISABLED'}")
     print("=" * 60)
     print("[INFO] Each violation creates a folder with 5 timestamped frames")
     print("[INFO] Press Ctrl+C to stop")
     print("=" * 60)
-
-   if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
