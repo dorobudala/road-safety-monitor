@@ -1,980 +1,718 @@
-"""
-ROAD SAFETY MONITOR - With Car Color Detection (5-Frame Burst on Violation)
-Saves: 5 frames (2 before + current + 2 after) per violation
-       + Car Color + Plate Number + Violation Type + Timestamp
-"""
+/*
+ * XIAO ESP32S3 + OV3660 Camera - Optimized MJPEG Stream
+ * Compatible with: Arduino IDE + ESP32 board package 3.x
+ * WiFi: 194CF2
+ */
 
-import cv2
-import time
-import torch
-import threading
-import os
-import json
-import uuid
-import numpy as np
-import urllib.request
-import ssl
-import socket
-import concurrent.futures
-from collections import deque
-from datetime import datetime
-from flask import Flask, Response, jsonify, request, send_from_directory
-from ultralytics import YOLO
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_task_wdt.h>
+#include <esp_wifi.h>
 
-# Try to import sklearn for color detection
-try:
-    from sklearn.cluster import KMeans
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    print("[WARN] scikit-learn not installed. Color detection will be limited.")
-    print("[INFO] Install with: pip install scikit-learn")
-    SKLEARN_AVAILABLE = False
+// ==================== WiFi Credentials ====================
+const char* ssid = "194CF2";
+const char* password = "pw9hxvgdmg";
 
-# ─────────────────────────────────────────────
-# FLASK SETUP
-# ─────────────────────────────────────────────
-app = Flask(__name__, static_folder="static")
-SNAPSHOT_DIR = "snapshots"
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+// ==================== Watchdog timeout (seconds) ====================
+#define WDT_TIMEOUT 10
 
-METADATA_FILE = os.path.join(SNAPSHOT_DIR, "violations_metadata.json")
+// ==================== Camera Pin Definitions for XIAO ESP32S3 ====================
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     10
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
 
-# ─────────────────────────────────────────────
-# LOAD YOLOv8
-# ─────────────────────────────────────────────
-print("[INFO] Loading YOLOv8...")
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
 
-MODEL_NAME = "yolov8n.pt"
+// Built-in LED for status (XIAO ESP32S3 has user LED on pin 21)
+// Set to -1 if your board doesn't have one or you don't want it
+#define STATUS_LED_PIN    -1   // Change to 21 for built-in LED
 
-try:
-    model = YOLO(MODEL_NAME)
-    print(f"[INFO] YOLOv8 loaded: {MODEL_NAME}")
-except Exception as e:
-    print(f"[ERROR] Failed to load YOLOv8: {e}")
-    exit(1)
+// ==================== Camera Settings ====================
+// FRAMESIZE_SVGA (800x600) is good for plate recognition
+// Drop to FRAMESIZE_VGA (640x480) if you get frame drop issues
+#define FRAME_SIZE FRAMESIZE_SVGA
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if DEVICE == "cuda":
-    model.to(DEVICE)
-    print("[INFO] YOLOv8 running on GPU")
-else:
-    print("[INFO] YOLOv8 running on CPU")
+// JPEG Quality: 0-63 (lower = better quality)
+// 8-12 = Excellent for YOLO detection, 15-20 = Good balance
+#define JPEG_QUALITY 10
 
-print(f"[INFO] YOLOv8 ready on {DEVICE.upper()}")
+// Single frame buffer to save PSRAM
+#define FB_COUNT 1
 
-# ─────────────────────────────────────────────
-# LOAD EasyOCR
-# ─────────────────────────────────────────────
-try:
-    import easyocr
-    print("[INFO] Loading EasyOCR...")
-    reader = easyocr.Reader(['en'], gpu=(DEVICE == "cuda"), verbose=False)
-    print("[INFO] EasyOCR ready")
-    OCR_AVAILABLE = True
-except ImportError:
-    print("[WARN] EasyOCR not installed.")
-    OCR_AVAILABLE = False
-    reader = None
+// Max FPS sent to client (actual capture may be higher)
+#define MAX_FPS 15
 
-# ─────────────────────────────────────────────
-# ROLLING FRAME BUFFER (per camera)
-# ─────────────────────────────────────────────
-BURST_BEFORE = 2          # frames to keep before violation
-BURST_AFTER  = 2          # frames to capture after violation
-BURST_TOTAL  = BURST_BEFORE + 1 + BURST_AFTER  # = 5
+// ==================== Web Server ====================
+WebServer server(80);
 
-class FrameBuffer:
-    """
-    Thread-safe rolling buffer that stores the last N raw frames.
-    Used to retrieve frames just before a violation was detected.
-    """
-    def __init__(self, maxlen=None):
-        if maxlen is None:
-            maxlen = BURST_BEFORE + 1
-        self._buf = deque(maxlen=maxlen)
-        self._lock = threading.Lock()
+// Performance tracking
+unsigned long last_fps_calc = 0;
+unsigned long last_reconnect_attempt = 0;
+int frame_counter = 0;
+float current_fps = 0;
+bool stream_active = false;
 
-    def push(self, frame):
-        with self._lock:
-            self._buf.append(frame.copy())
+// Wi-Fi reconnection
+bool wifi_was_connected = false;
+#define WIFI_RECONNECT_INTERVAL 30000   // Try reconnect every 30 seconds
 
-    def get_recent(self, n):
-        """Return up to n most-recent frames (oldest first)."""
-        with self._lock:
-            frames = list(self._buf)
-        return frames[-n:] if len(frames) >= n else frames
-
-
-# One buffer per camera
-frame_buffers = {
-    "CAM-1": FrameBuffer(maxlen=BURST_BEFORE + 1),
-    "CAM-2": FrameBuffer(maxlen=BURST_BEFORE + 1),
+// ==================== Status LED Helpers ====================
+void ledOn() {
+  if (STATUS_LED_PIN >= 0) digitalWrite(STATUS_LED_PIN, HIGH);
 }
 
-# ─────────────────────────────────────────────
-# PENDING BURST CAPTURES
-# ─────────────────────────────────────────────
-pending_bursts = {"CAM-1": [], "CAM-2": []}
-pending_bursts_lock = threading.Lock()
+void ledOff() {
+  if (STATUS_LED_PIN >= 0) digitalWrite(STATUS_LED_PIN, LOW);
+}
 
+void ledBlink(int times, int delayMs = 200) {
+  for (int i = 0; i < times; i++) {
+    ledOn();
+    delay(delayMs);
+    ledOff();
+    delay(delayMs);
+  }
+}
 
-class BurstCapture:
-    """Manages saving of all 5 frames for a single violation event."""
+// ==================== Initialize Camera ====================
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;  // 20MHz (stable for OV3660)
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAME_SIZE;
+  config.jpeg_quality = JPEG_QUALITY;
+  config.fb_count = FB_COUNT;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-    def __init__(self, cam_id, plate, violation, confidence, vehicle_type,
-                 vehicle_id, car_color, x1, y1, x2, y2, pre_frames):
-        self.cam_id       = cam_id
-        self.plate        = plate
-        self.violation    = violation
-        self.confidence   = confidence
-        self.vehicle_type = vehicle_type
-        self.vehicle_id   = vehicle_id
-        self.car_color    = car_color
-        self.x1, self.y1 = x1, y1
-        self.x2, self.y2 = x2, y2
+  // Initialize camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
 
-        # Build unique folder for this burst
-        ts      = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        uid     = uuid.uuid4().hex[:6]
-        safe_p  = ''.join(c for c in plate if c.isalnum()) if plate != "UNKNOWN" else "UNKNOWN"
-        safe_v  = violation.replace(" ", "_")
-        self.folder_name = f"{cam_id}_{safe_p}_{car_color}_{safe_v}_{ts}_{uid}"
-        self.folder_path = os.path.join(SNAPSHOT_DIR, self.folder_name)
-        os.makedirs(self.folder_path, exist_ok=True)
+  // Configure sensor for optimal quality
+  sensor_t* s = esp_camera_sensor_get();
+  
+  // Basic image tuning
+  s->set_brightness(s, 0);      // -2 to 2
+  s->set_contrast(s, 0);        // -2 to 2
+  s->set_saturation(s, 1);      // Slight saturation boost helps color detection
+  s->set_special_effect(s, 0);  // No effect
+  
+  // Auto controls ON (important for outdoor use)
+  s->set_whitebal(s, 1);        // Auto white balance
+  s->set_awb_gain(s, 1);        // AWB gain
+  s->set_exposure_ctrl(s, 1);   // Auto exposure
+  s->set_gain_ctrl(s, 1);       // Auto gain
+  s->set_aec2(s, 1);            // Advanced AEC
+  
+  // Quality enhancements
+  s->set_raw_gma(s, 1);         // Gamma correction
+  s->set_lenc(s, 1);            // Lens correction
+  s->set_dcw(s, 1);             // Downsize enable
+  
+  // Exposure bias: slightly brighter for plate recognition (0-1200)
+  s->set_aec_value(s, 400);
+  
+  // Sharpness: helps OCR read plates
+  s->set_sharpness(s, 1);       // 0 = auto, 1 = slight sharpen
+  
+  // Mirror/flip based on your mount orientation
+  s->set_hmirror(s, 0);         // 1 = horizontal mirror
+  s->set_vflip(s, 0);           // 1 = vertical flip
 
-        self.saved_count  = 0
-        self.after_needed = BURST_AFTER
-        self.filenames    = []
+  Serial.println("Camera initialized: OV3660 SVGA 800x600");
+  return true;
+}
 
-        # Save pre-violation + current frames immediately
-        for frame in pre_frames:
-            self._save_frame(frame)
-
-    def feed_after_frame(self, frame):
-        if self.after_needed <= 0:
-            return True
-        self._save_frame(frame)
-        self.after_needed -= 1
-        return self.after_needed == 0
-
-    def _save_frame(self, raw_frame):
-        h, w = raw_frame.shape[:2]
-        margin  = SNAPSHOT_MARGIN
-        cx1     = max(0, self.x1 - margin)
-        cy1     = max(0, self.y1 - margin)
-        cx2     = min(w, self.x2 + margin)
-        cy2     = min(h, self.y2 + margin)
-        roi     = raw_frame[cy1:cy2, cx1:cx2]
-
-        if roi.size == 0:
-            roi = raw_frame.copy()
-
-        rh, rw = roi.shape[:2]
-        if rw < SNAPSHOT_MIN_WIDTH or rh < SNAPSHOT_MIN_HEIGHT:
-            scale_w = max(SNAPSHOT_MIN_WIDTH / max(rw, 1), 1.2)
-            scale_h = max(SNAPSHOT_MIN_HEIGHT / max(rh, 1), 1.2)
-            roi = cv2.resize(roi, (int(rw * scale_w), int(rh * scale_h)),
-                             interpolation=cv2.INTER_CUBIC)
-
-        roi = self._annotate(roi)
-
-        frame_num = self.saved_count + 1
-        fname     = f"frame_{frame_num}.jpg"
-        fpath     = os.path.join(self.folder_path, fname)
-        cv2.imwrite(fpath, roi)
-        self.filenames.append(fname)
-        self.saved_count += 1
-
-    def _annotate(self, img):
-        color_map_for_bar = {
-            "RED": (0, 0, 255), "BLUE": (255, 0, 0), "GREEN": (0, 255, 0),
-            "YELLOW": (0, 255, 255), "BLACK": (0, 0, 0), "WHITE": (255, 255, 255),
-            "GRAY": (128, 128, 128), "SILVER": (192, 192, 192),
-            "ORANGE": (0, 165, 255), "PURPLE": (128, 0, 128),
-            "PINK": (203, 192, 255), "BROWN": (42, 42, 165),
-            "CYAN": (255, 255, 0), "OTHER": (100, 100, 100)
-        }
-
-        bar_color = color_map_for_bar.get(self.car_color, (100, 100, 100))
-        h_img, w_img = img.shape[:2]
-
-        bar_h   = 130
-        overlay = img.copy()
-        cv2.rectangle(overlay, (0, 0), (w_img, bar_h), (0, 0, 0), -1)
-        img = cv2.addWeighted(overlay, 0.6, img, 0.4, 0)
-
-        cv2.rectangle(img, (0, 0), (15, h_img), bar_color, -1)
-
-        font  = cv2.FONT_HERSHEY_SIMPLEX
-        fscl  = 0.7
-        thick = 2
-
-        cv2.putText(img, f"COLOR: {self.car_color}",          (25,  28), font, fscl, bar_color,        thick)
-        cv2.putText(img, f"PLATE: {self.plate}",               (25,  53), font, fscl, (0, 255, 0),      thick)
-        cv2.putText(img, f"TYPE:  {self.vehicle_type.upper()}",(25,  78), font, fscl, (255, 255, 255),  thick)
-        cv2.putText(img, f"VIOLATION: {self.violation.replace('_',' ')}", (25, 103), font, 0.6, (0, 165, 255), 2)
-
-        frame_label = f"FRAME {self.saved_count + 1}/{BURST_TOTAL}"
-        cv2.putText(img, frame_label, (25, 128), font, 0.55, (200, 200, 0), 2)
-
-        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        (tw, _), _ = cv2.getTextSize(ts_str, font, 0.5, 1)
-        cv2.putText(img, ts_str, (w_img - tw - 10, h_img - 10), font, 0.5, (200, 200, 200), 1)
-
-        cv2.rectangle(img, (0, 0), (w_img - 1, h_img - 1), (0, 255, 255), 3)
-        return img
-
-    def metadata(self):
-        return {
-            "folder":       self.folder_name,
-            "timestamp":    datetime.now().isoformat(),
-            "camera":       self.cam_id,
-            "plate":        self.plate,
-            "color":        self.car_color,
-            "vehicle_type": self.vehicle_type,
-            "violation":    self.violation.replace("_", " "),
-            "confidence":   self.confidence,
-            "folder_path":  self.folder_path,
-            "frames":       self.filenames,
-            "total_frames": BURST_TOTAL,
-        }
-
-
-# ─────────────────────────────────────────────
-# CAR COLOR DETECTION (with caching)
-# ─────────────────────────────────────────────
-color_cache = {}
-COLOR_CACHE_TTL = 3.0
-
-
-def detect_car_color(vehicle_image):
-    if vehicle_image is None or vehicle_image.size == 0:
-        return "UNKNOWN"
-
-    color_ranges = {
-        "RED":    [(0, 50, 50), (10, 255, 255), (170, 50, 50), (180, 255, 255)],
-        "ORANGE": [(11, 50, 50), (22, 255, 255)],
-        "YELLOW": [(23, 50, 50), (35, 255, 255)],
-        "GREEN":  [(36, 50, 50), (85, 255, 255)],
-        "BLUE":   [(86, 50, 50), (125, 255, 255)],
-        "PURPLE": [(126, 50, 50), (145, 255, 255)],
-        "PINK":   [(146, 50, 50), (165, 255, 255)],
-        "WHITE":  [(0, 0, 200), (180, 30, 255)],
-        "BLACK":  [(0, 0, 0), (180, 255, 50)],
-        "GRAY":   [(0, 0, 50), (180, 50, 200)],
-        "SILVER": [(0, 0, 100), (180, 30, 200)],
-        "BROWN":  [(10, 50, 50), (20, 255, 150)],
-        "CYAN":   [(85, 50, 50), (95, 255, 255)]
+// ==================== MJPEG Stream Handler ====================
+void handleStream() {
+  Serial.println("Stream client connected");
+  
+  WiFiClient client = server.client();
+  
+  // Build HTTP response header
+  String head = "HTTP/1.1 200 OK\r\n";
+  head += "Content-Type: multipart/x-mixed-replace; boundary=--frameboundary\r\n";
+  head += "Cache-Control: no-cache, no-store, must-revalidate\r\n";
+  head += "Pragma: no-cache\r\n";
+  head += "Expires: 0\r\n";
+  head += "Connection: close\r\n";
+  head += "Access-Control-Allow-Origin: *\r\n";
+  head += "\r\n";
+  
+  client.print(head);
+  
+  unsigned long last_frame_time = 0;
+  unsigned long stream_start = millis();
+  int frame_delay_ms = (MAX_FPS > 0) ? (1000 / MAX_FPS) : 0;
+  int frames_sent = 0;
+  int consecutive_failures = 0;
+  const int MAX_CONSECUTIVE_FAILURES = 10;
+  
+  stream_active = true;
+  
+  while (client.connected() && stream_active) {
+    // Feed watchdog
+    esp_task_wdt_reset();
+    
+    // Frame rate limiting
+    unsigned long now = millis();
+    if (frame_delay_ms > 0 && (now - last_frame_time < frame_delay_ms)) {
+      delay(1);
+      continue;
     }
-
-    h, w = vehicle_image.shape[:2]
-    if h > 200 or w > 200:
-        vehicle_image = cv2.resize(vehicle_image, (200, 200))
-
-    hsv = cv2.cvtColor(vehicle_image, cv2.COLOR_BGR2HSV)
-    best_match, best_score = "UNKNOWN", 0
-
-    for color_name, ranges in color_ranges.items():
-        if len(ranges) == 4:
-            l1, u1, l2, u2 = np.array(ranges[0]), np.array(ranges[1]), \
-                              np.array(ranges[2]), np.array(ranges[3])
-            mask = cv2.bitwise_or(cv2.inRange(hsv, l1, u1), cv2.inRange(hsv, l2, u2))
-        else:
-            mask = cv2.inRange(hsv, np.array(ranges[0]), np.array(ranges[1]))
-
-        score = np.sum(mask > 0) / (hsv.shape[0] * hsv.shape[1])
-        if score > best_score:
-            best_score = score
-            best_match = color_name
-
-    if best_match == "UNKNOWN" or best_score < 0.1:
-        r, g, b = np.mean(vehicle_image, axis=(0, 1))[[2, 1, 0]]
-        if   r > 200 and g > 200 and b > 200:    best_match = "WHITE"
-        elif r < 50  and g < 50  and b < 50:     best_match = "BLACK"
-        elif r > 200 and g < 100 and b < 100:    best_match = "RED"
-        elif r < 100 and g > 200 and b < 100:    best_match = "GREEN"
-        elif r < 100 and g < 100 and b > 200:    best_match = "BLUE"
-        elif r > 150 and g > 150 and b < 100:    best_match = "YELLOW"
-        elif abs(r-g) < 30 and abs(g-b) < 30 and r > 100: best_match = "SILVER"
-        else:                                    best_match = "OTHER"
-
-    return best_match
-
-
-def get_cached_color(vehicle_id, vehicle_image):
-    now = time.time()
-    if vehicle_id in color_cache:
-        cached_color, expiry = color_cache[vehicle_id]
-        if now < expiry:
-            return cached_color
-    color = detect_car_color(vehicle_image)
-    color_cache[vehicle_id] = (color, now + COLOR_CACHE_TTL)
-    return color
-
-
-# ─────────────────────────────────────────────
-# COCO CLASS IDs
-# ─────────────────────────────────────────────
-CLS_PERSON        = 0
-CLS_BICYCLE       = 1
-CLS_CAR           = 2
-CLS_MOTORCYCLE    = 3
-CLS_BUS           = 5
-CLS_TRUCK         = 7
-CLS_TRAFFIC_LIGHT = 9
-CLS_CELL_PHONE    = 67
-
-VEHICLE_CLASSES  = {CLS_CAR, CLS_MOTORCYCLE, CLS_BUS, CLS_TRUCK, CLS_BICYCLE}
-ALL_USED_CLASSES = VEHICLE_CLASSES | {CLS_PERSON, CLS_TRAFFIC_LIGHT, CLS_CELL_PHONE}
-SNAPSHOT_CLASSES = {CLS_CAR, CLS_TRUCK, CLS_BUS, CLS_MOTORCYCLE}
-
-# ─────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────
-WRONG_LANE_THRESHOLD    = 0.38
-PARKING_FRAME_THRESHOLD = 150
-PARKING_MIN_DURATION    = 5.0
-SPEED_GROWTH_THRESHOLD  = 0.18
-COOLDOWN_SECONDS        = 10
-OCR_MIN_HEIGHT          = 30
-OCR_EVERY_N_FRAMES      = 10
-CONFIDENCE_THRESHOLD    = 0.45
-CROSSED_MEMORY_SECONDS  = 15
-
-SNAPSHOT_MARGIN     = 40
-SNAPSHOT_MIN_WIDTH  = 400
-SNAPSHOT_MIN_HEIGHT = 300
-
-# ─────────────────────────────────────────────
-# GLOBAL STATE
-# ─────────────────────────────────────────────
-running   = False
-frames    = {"CAM-1": None, "CAM-2": None}
-frame_count = {"CAM-1": 0, "CAM-2": 0}
-connected = {"CAM-1": False, "CAM-2": False}
-fps_stats = {"CAM-1": 0, "CAM-2": 0}
-
-log  = []
-lock = threading.Lock()
-
-
-class CameraState:
-    def __init__(self):
-        self.tracks     = {}
-        self.cooldowns  = {}
-        self.light_color = "unknown"
-        self.crossed    = {}
-        self.frame_n    = 0
-
-    def is_red_light_crossed(self, tid):
-        now     = time.time()
-        expired = [k for k, v in self.crossed.items() if v < now]
-        for k in expired:
-            del self.crossed[k]
-        return tid in self.crossed
-
-    def mark_red_light_crossed(self, tid):
-        self.crossed[tid] = time.time() + CROSSED_MEMORY_SECONDS
-
-
-cam_state = {"CAM-1": CameraState(), "CAM-2": CameraState()}
-
-# ─────────────────────────────────────────────
-# ROUTES
-# ─────────────────────────────────────────────
-@app.route("/")
-def home():
-    return send_from_directory('.', 'index.html')
-
-
-@app.route("/snapshots/<path:filename>")
-def serve_snapshot(filename):
-    return send_from_directory(SNAPSHOT_DIR, filename)
-
-
-# ─────────────────────────────────────────────
-# BURST SNAPSHOT TRIGGER
-# ─────────────────────────────────────────────
-def trigger_burst_snapshot(frame, x1, y1, x2, y2, cam_id, plate, violation,
-                            confidence, vehicle_type, vehicle_id):
-    h, w = frame.shape[:2]
-    margin   = SNAPSHOT_MARGIN
-    cx1, cy1 = max(0, x1 - margin), max(0, y1 - margin)
-    cx2, cy2 = min(w, x2 + margin), min(h, y2 + margin)
-    roi      = frame[cy1:cy2, cx1:cx2]
-    car_color = get_cached_color(vehicle_id, roi) if roi.size > 0 else "UNKNOWN"
-
-    pre_frames = frame_buffers[cam_id].get_recent(BURST_BEFORE)
-    pre_frames.append(frame)
-
-    burst = BurstCapture(
-        cam_id=cam_id, plate=plate, violation=violation,
-        confidence=confidence, vehicle_type=vehicle_type,
-        vehicle_id=vehicle_id, car_color=car_color,
-        x1=x1, y1=y1, x2=x2, y2=y2,
-        pre_frames=pre_frames,
-    )
-
-    with pending_bursts_lock:
-        pending_bursts[cam_id].append(burst)
-
-    print(f"[{cam_id}] BURST started ({BURST_TOTAL} frames) | "
-          f"{car_color} {vehicle_type} | Plate: {plate} | {violation}")
-
-    return burst.folder_name
-
-
-def feed_pending_bursts(cam_id, raw_frame):
-    completed = []
-    with pending_bursts_lock:
-        active = list(pending_bursts[cam_id])
-
-    for burst in active:
-        done = burst.feed_after_frame(raw_frame)
-        if done:
-            completed.append(burst)
-
-    for burst in completed:
-        with pending_bursts_lock:
-            try:
-                pending_bursts[cam_id].remove(burst)
-            except ValueError:
-                pass
-        _save_burst_metadata(burst)
-        print(f"[{burst.cam_id}] BURST complete: {burst.folder_name} "
-              f"({burst.saved_count} frames saved)")
-
-
-def _save_burst_metadata(burst):
-    meta = burst.metadata()
-    try:
-        if os.path.exists(METADATA_FILE):
-            with open(METADATA_FILE, 'r') as f:
-                all_meta = json.load(f)
-        else:
-            all_meta = []
-        all_meta.append(meta)
-        with open(METADATA_FILE, 'w') as f:
-            json.dump(all_meta, f, indent=2)
-    except Exception as e:
-        print(f"[WARN] Could not save metadata: {e}")
-
-
-# ─────────────────────────────────────────────
-# OCR
-# ─────────────────────────────────────────────
-def read_plate(frame, x1, y1, x2, y2):
-    if not OCR_AVAILABLE:
-        return "UNKNOWN"
-    bh = y2 - y1
-    if bh < OCR_MIN_HEIGHT:
-        return "TOO_SMALL"
-    py1 = y1 + int(bh * 0.70)
-    roi = frame[py1:y2, x1:x2]
-    if roi.size == 0:
-        return "UNKNOWN"
-    try:
-        if roi.shape[0] < 40 or roi.shape[1] < 100:
-            roi = cv2.resize(roi, (int(roi.shape[1] * 2), int(roi.shape[0] * 2)))
-        gray     = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        kernel   = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel)
-        res   = reader.readtext(sharpened,
-                                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
-        texts = [r[1] for r in res if r[2] > 0.3 and len(r[1]) >= 4]
-        return texts[0].upper() if texts else "UNKNOWN"
-    except Exception:
-        return "UNKNOWN"
-
-
-def can_log(state, plate, violation):
-    key = (plate, violation)
-    now = time.time()
-    if now - state.cooldowns.get(key, 0) < COOLDOWN_SECONDS:
-        return False
-    state.cooldowns[key] = now
-    return True
-
-
-def make_tid(cls_id, cx, cy, grid=60):
-    return f"{cls_id}_{cx // grid}_{cy // grid}"
-
-
-def classify_light(frame, x1, y1, x2, y2):
-    roi = frame[y1:y2, x1:x2]
-    if roi.size == 0:
-        return "unknown"
-    h      = roi.shape[0]
-    third  = max(1, h // 3)
-    hsv    = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    r1     = cv2.inRange(hsv, np.array([0,   120, 100]), np.array([10,  255, 255]))
-    r2     = cv2.inRange(hsv, np.array([170, 120, 100]), np.array([180, 255, 255]))
-    red    = cv2.bitwise_or(r1, r2)
-    green  = cv2.inRange(hsv, np.array([40, 80, 80]), np.array([90, 255, 255]))
-    if cv2.countNonZero(red[:third])        > 10: return "red"
-    if cv2.countNonZero(green[2*third:])    > 10: return "green"
-    return "unknown"
-
-
-# ─────────────────────────────────────────────
-# VIOLATION ENGINE
-# ─────────────────────────────────────────────
-def detect_violations(detections, cam_id, frame):
-    state  = cam_state[cam_id]
-    fh, fw = frame.shape[:2]
-    events = []
-    now_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    now    = time.time()
-
-    do_scheduled_ocr = (state.frame_n % OCR_EVERY_N_FRAMES == 0)
-    state.frame_n += 1
-
-    for d in detections:
-        if d['cls_id'] == CLS_TRAFFIC_LIGHT:
-            c = classify_light(frame, d['x1'], d['y1'], d['x2'], d['y2'])
-            if c != "unknown":
-                state.light_color = c
-
-    col = {'red': (0,0,255), 'green': (0,255,0)}.get(state.light_color, (128,128,128))
-    cv2.putText(frame, f"LIGHT: {state.light_color.upper()}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
-
-    for d in detections:
-        cls_id        = d['cls_id']
-        x1,y1,x2,y2  = d['x1'], d['y1'], d['x2'], d['y2']
-        conf          = d['conf']
-        label         = d['label']
-        cx, cy        = (x1+x2)//2, (y1+y2)//2
-        bw, bh        = x2-x1, y2-y1
-
-        tid  = make_tid(cls_id, cx, cy)
-        prev = state.tracks.get(tid, {
-            'bw': bw, 'cx': cx, 'cy': cy,
-            'still_count': 0, 'still_start': None
-        })
-
-        violation  = None
-        force_ocr  = False
-
-        # ── RED LIGHT ──
-        if (cls_id in VEHICLE_CLASSES and
-            state.light_color == "red" and
-            cy > fh * 0.40 and
-            not state.is_red_light_crossed(tid)):
-            if abs(cx - prev['cx']) > 5 or abs(cy - prev['cy']) > 5:
-                violation = "RED_LIGHT"
-                state.mark_red_light_crossed(tid)
-                force_ocr = True
-
-        # ── SPEEDING ──
-        if violation is None and cls_id in VEHICLE_CLASSES:
-            growth = (bw - prev['bw']) / max(prev['bw'], 1)
-            if growth > SPEED_GROWTH_THRESHOLD:
-                violation = "SPEEDING"
-                force_ocr = True
-
-        # ── WRONG LANE ──
-        if violation is None and cls_id in VEHICLE_CLASSES:
-            if (cx / fw) < WRONG_LANE_THRESHOLD and cy > fh * 0.3:
-                violation = "WRONG_LANE"
-                force_ocr = True
-
-        # ── ILLEGAL PARKING ──
-        if violation is None and cls_id in VEHICLE_CLASSES:
-            if abs(cx - prev['cx']) < 3 and abs(cy - prev['cy']) < 3:
-                prev['still_count'] += 1
-                if prev['still_start'] is None:
-                    prev['still_start'] = now
-            else:
-                prev['still_count']  = 0
-                prev['still_start']  = None
-
-            if (prev['still_count'] >= PARKING_FRAME_THRESHOLD and
-                    prev['still_start'] is not None):
-                still_duration = now - prev['still_start']
-                if still_duration >= PARKING_MIN_DURATION:
-                    if cx / fw < WRONG_LANE_THRESHOLD or state.light_color != "red":
-                        violation = "ILLEGAL_PARKING"
-                        force_ocr = True
-
-        # ── PHONE USE ──
-        if violation is None and cls_id == CLS_CELL_PHONE:
-            violation = "PHONE_USE"
-            force_ocr = True
-
-        # Update track
-        state.tracks[tid] = {
-            'bw':          bw,
-            'cx':          cx,
-            'cy':          cy,
-            'still_count': prev.get('still_count', 0),
-            'still_start': prev.get('still_start', None),
-        }
-
-        # ── Handle violation ──
-        if violation:
-            plate = "UNKNOWN"
-            if cls_id in VEHICLE_CLASSES:
-                if do_scheduled_ocr or force_ocr:
-                    plate = read_plate(frame, x1, y1, x2, y2)
-
-            snap_folder = ""
-            if cls_id in SNAPSHOT_CLASSES:
-                vehicle_id  = f"{cam_id}_{tid}"
-                snap_folder = trigger_burst_snapshot(
-                    frame, x1, y1, x2, y2, cam_id,
-                    plate, violation, f"{int(conf*100)}%", label, vehicle_id
-                )
-
-            if can_log(state, plate, violation):
-                events.append({
-                    "ts":            now_ts,
-                    "camera":        cam_id,
-                    "plate":         plate,
-                    "vehicle_class": label,
-                    "violation":     violation.replace("_", " "),
-                    "probability":   f"{int(conf*100)}%",
-                    "snapshot":      snap_folder,
-                    "burst_frames":  BURST_TOTAL,
-                })
-                print(f"[{cam_id}] {violation} - {plate}")
-
-    return events
-
-
-# ─────────────────────────────────────────────
-# DRAW OVERLAY
-# ─────────────────────────────────────────────
-def draw_detections(frame, detections, cam_id):
-    fh, fw = frame.shape[:2]
-    lx = int(fw * WRONG_LANE_THRESHOLD)
-    cv2.line(frame, (lx, 0), (lx, fh), (0, 200, 255), 2)
-    cv2.putText(frame, "LANE", (lx+4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,200,255), 1)
-
-    fps = fps_stats.get(cam_id, 0)
-    cv2.putText(frame, f"FPS: {fps}", (fw-80, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
-
-    color_map = {
-        CLS_CAR:           (0,  255, 100),
-        CLS_TRUCK:         (0,  200, 255),
-        CLS_BUS:           (255,165,  0),
-        CLS_MOTORCYCLE:    (255,255,  0),
-        CLS_BICYCLE:       (180,255,180),
-        CLS_PERSON:        (255,100,100),
-        CLS_CELL_PHONE:    (0,  100, 255),
-        CLS_TRAFFIC_LIGHT: (200,200,  0),
+    last_frame_time = now;
+    
+    // Capture frame
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      consecutive_failures++;
+      if (consecutive_failures > MAX_CONSECUTIVE_FAILURES) {
+        Serial.println("Too many capture failures, stopping stream");
+        break;
+      }
+      delay(10);
+      continue;
     }
+    consecutive_failures = 0;
+    
+    // Validate JPEG data: check for valid JPEG header
+    bool valid_jpeg = (fb->len > 100) && 
+                      (fb->buf[0] == 0xFF) && 
+                      (fb->buf[1] == 0xD8);
+    
+    if (!valid_jpeg) {
+      Serial.printf("Invalid JPEG header: %02X %02X (len=%d)\n", 
+                    fb->buf[0], fb->buf[1], fb->len);
+      esp_camera_fb_return(fb);
+      delay(5);
+      continue;
+    }
+    
+    // Send MJPEG frame boundary
+    client.print("--frameboundary\r\n");
+    client.print("Content-Type: image/jpeg\r\n");
+    client.printf("Content-Length: %d\r\n", fb->len);
+    client.print("\r\n");
+    
+    // Send image data
+    size_t written = client.write(fb->buf, fb->len);
+    client.print("\r\n");
+    
+    if (written != fb->len) {
+      Serial.printf("Write incomplete: %d/%d bytes\n", written, fb->len);
+      esp_camera_fb_return(fb);
+      break;
+    }
+    
+    frames_sent++;
+    
+    // Print stats every 30 frames
+    if (frames_sent % 30 == 0) {
+      float elapsed = (millis() - stream_start) / 1000.0;
+      if (elapsed > 0) {
+        current_fps = frames_sent / elapsed;
+        Serial.printf("FPS: %.1f | Frame: %d bytes | Total: %d frames | Free heap: %d\n", 
+                      current_fps, fb->len, frames_sent, ESP.getFreeHeap());
+      }
+    }
+    
+    // Return frame buffer
+    esp_camera_fb_return(fb);
+    
+    // Yield to allow WiFi and other tasks to run
+    yield();
+    
+    // Check if client disconnected
+    if (!client.connected()) {
+      Serial.println("Stream client disconnected");
+      break;
+    }
+  }
+  
+  stream_active = false;
+  
+  if (frames_sent > 0) {
+    float total_time = (millis() - stream_start) / 1000.0;
+    Serial.printf("Stream ended. Sent %d frames in %.1f seconds (%.1f avg FPS)\n", 
+                  frames_sent, total_time, frames_sent / total_time);
+  }
+}
 
-    for d in detections:
-        x1,y1,x2,y2 = d['x1'], d['y1'], d['x2'], d['y2']
-        col   = color_map.get(d['cls_id'], (180,180,180))
-        label = f"{d['label']} {d['conf']:.0%}"
-        if d.get('plate') and d['plate'] not in ['UNKNOWN','TOO_SMALL']:
-            label += f" [{d['plate']}]"
-        cv2.rectangle(frame, (x1,y1), (x2,y2), col, 2)
-        (tw,th),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (x1, y1-th-8), (x1+tw+4, y1), col, -1)
-        cv2.putText(frame, label, (x1+2, y1-4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+// ==================== Single Frame Capture ====================
+void handleCapture() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Capture failed");
+    return;
+  }
+  
+  // Validate JPEG
+  if (fb->len < 100 || fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) {
+    esp_camera_fb_return(fb);
+    server.send(500, "text/plain", "Invalid JPEG data");
+    return;
+  }
+  
+  WiFiClient client = server.client();
+  
+  String head = "HTTP/1.1 200 OK\r\n";
+  head += "Content-Type: image/jpeg\r\n";
+  head += "Content-Length: " + String(fb->len) + "\r\n";
+  head += "Cache-Control: no-cache\r\n";
+  head += "\r\n";
+  client.print(head);
+  client.write(fb->buf, fb->len);
+  
+  esp_camera_fb_return(fb);
+}
 
-    return frame
+// ==================== Status/Info Endpoint ====================
+void handleStatus() {
+  String json = "{";
+  json += "\"camera\":\"OV3660\",";
+  json += "\"resolution\":\"800x600\",";
+  json += "\"fps\":" + String(current_fps, 1) + ",";
+  json += "\"stream_active\":" + String(stream_active ? "true" : "false") + ",";
+  json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"psram_size\":" + String(ESP.getPsramSize()) + ",";
+  json += "\"free_psram\":" + String(ESP.getFreePsram()) + ",";
+  json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"uptime\":" + String(millis() / 1000);
+  json += "}";
+  
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
 
+// ==================== Restart Endpoint ====================
+void handleRestart() {
+  server.send(200, "text/plain", "Restarting...");
+  delay(100);
+  ESP.restart();
+}
 
-# ─────────────────────────────────────────────
-# PROCESS FRAME
-# ─────────────────────────────────────────────
-def process_frame(frame, cam_id):
-    frame_buffers[cam_id].push(frame)
-    feed_pending_bursts(cam_id, frame)
-
-    results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
-    detections = []
-
-    for result in results:
-        boxes = result.boxes
-        if boxes is not None:
-            for box in boxes:
-                x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-                conf   = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                if cls_id not in ALL_USED_CLASSES:
-                    continue
-                detections.append({
-                    'x1': x1,'y1': y1,'x2': x2,'y2': y2,
-                    'conf': conf,'cls_id': cls_id,
-                    'label': model.names[cls_id],
+// ==================== Web Dashboard ====================
+void handleRoot() {
+  String ip = (WiFi.status() == WL_CONNECTED) ? 
+              WiFi.localIP().toString() : 
+              WiFi.softAPIP().toString();
+  
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>XIAO ESP32S3 Road Monitor</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0c0f;
+            color: #c8d8e8;
+            padding: 20px;
+        }
+        h1 {
+            color: #00e5ff;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        .stream-container {
+            background: #000;
+            border: 2px solid #00e5ff;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            position: relative;
+            aspect-ratio: 4/3;
+        }
+        .stream-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+        .status-overlay {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            color: #00e676;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .info-panel {
+            background: #111720;
+            border: 1px solid #1e2a38;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #1e2a38;
+        }
+        .info-row:last-child { border-bottom: none; }
+        .info-label { color: #4a6070; font-weight: bold; }
+        .info-value { color: #00e676; font-family: monospace; }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        button {
+            background: #00e5ff;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-family: monospace;
+            transition: background 0.2s;
+        }
+        button:hover { background: #33eeff; }
+        button.danger { background: #ff3d57; color: #fff; }
+        button.danger:hover { background: #ff6677; }
+        .url-box {
+            background: #0a0c0f;
+            padding: 12px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            word-break: break-all;
+            margin-top: 10px;
+            border: 1px solid #1e2a38;
+        }
+        .url-box code { color: #00e5ff; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .live { color: #00e676; animation: pulse 1.5s infinite; }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <h1>SAFEGUARD Road Monitor</h1>
+        
+        <div class='stream-container'>
+            <img id='stream' src='/stream' alt='Camera Stream'>
+            <div class='status-overlay' id='fps-overlay'>-- FPS</div>
+        </div>
+        
+        <div class='info-panel'>
+            <div class='info-row'>
+                <span class='info-label'>Camera:</span>
+                <span class='info-value'>OV3660 800x600</span>
+            </div>
+            <div class='info-row'>
+                <span class='info-label'>Quality:</span>
+                <span class='info-value'>JPEG )rawliteral";
+  
+  html += String(JPEG_QUALITY);
+  
+  html += R"rawliteral(</span>
+            </div>
+            <div class='info-row'>
+                <span class='info-label'>FPS:</span>
+                <span class='info-value' id='fps'>--</span>
+            </div>
+            <div class='info-row'>
+                <span class='info-label'>Free Heap:</span>
+                <span class='info-value' id='heap'>--</span>
+            </div>
+            <div class='info-row'>
+                <span class='info-label'>WiFi RSSI:</span>
+                <span class='info-value' id='rssi'>--</span>
+            </div>
+            <div class='info-row'>
+                <span class='info-label'>Stream:</span>
+                <span class='info-value live' id='stream-status'>ACTIVE</span>
+            </div>
+            <div class='url-box'>
+                <strong>Stream URL for Python server:</strong><br>
+                <code>http://)rawliteral";
+  
+  html += ip;
+  
+  html += R"rawliteral(/stream</code>
+            </div>
+        </div>
+        
+        <div class='button-group'>
+            <button onclick='refreshStream()'>Refresh Stream</button>
+            <button onclick='capture()'>Take Snapshot</button>
+            <button class='danger' onclick='restartDevice()'>Restart ESP32</button>
+        </div>
+    </div>
+    
+    <script>
+        function refreshStream() {
+            document.getElementById('stream').src = '/stream?' + Date.now();
+        }
+        
+        function capture() {
+            window.open('/capture?' + Date.now(), '_blank');
+        }
+        
+        function restartDevice() {
+            if (confirm('Restart the ESP32?')) {
+                fetch('/restart').catch(() => {});
+                setTimeout(() => location.reload(), 3000);
+            }
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('fps').innerText = data.fps + ' FPS';
+                    document.getElementById('heap').innerText = 
+                        (data.free_heap / 1024).toFixed(0) + ' KB';
+                    document.getElementById('rssi').innerText = 
+                        data.wifi_rssi + ' dBm';
+                    document.getElementById('fps-overlay').innerText = 
+                        data.fps + ' FPS';
+                    const status = document.getElementById('stream-status');
+                    if (data.stream_active) {
+                        status.innerText = 'ACTIVE';
+                        status.className = 'info-value live';
+                    } else {
+                        status.innerText = 'IDLE';
+                        status.className = 'info-value';
+                    }
                 })
+                .catch(() => {});
+        }
+        
+        setInterval(updateStatus, 2000);
+        updateStatus();
+        
+        // Auto-reconnect stream on error
+        const img = document.getElementById('stream');
+        img.onerror = function() {
+            setTimeout(() => {
+                img.src = '/stream?' + Date.now();
+            }, 2000);
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
 
-    events = detect_violations(detections, cam_id, frame)
-    if events:
-        with lock:
-            log.extend(events)
+// ==================== Handle 404 ====================
+void handleNotFound() {
+  server.send(404, "text/plain", 
+              "404: Not Found\nUse /stream for MJPEG stream\n"
+              "Endpoints: / /stream /capture /status /restart");
+}
 
-    return draw_detections(frame, detections, cam_id)
+// ==================== Connect to WiFi ====================
+bool connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.print(ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[OK] WiFi connected!");
+    Serial.print("     IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("     Gateway:    ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("     RSSI:       ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    
+    // Set WiFi auto-reconnect
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    
+    // Disable power saving for lower latency
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    
+    wifi_was_connected = true;
+    return true;
+  } else {
+    Serial.println("\n[FAIL] WiFi connection failed");
+    wifi_was_connected = false;
+    return false;
+  }
+}
 
+// ==================== WiFi Keep-Alive Check ====================
+void checkWiFi() {
+  // Check if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifi_was_connected) {
+      Serial.println("[WARN] WiFi disconnected! Attempting reconnect...");
+      wifi_was_connected = false;
+      ledBlink(3, 100);  // 3 fast blinks = connection lost
+    }
+    
+    // Attempt reconnection periodically
+    unsigned long now = millis();
+    if (now - last_reconnect_attempt > WIFI_RECONNECT_INTERVAL) {
+      last_reconnect_attempt = now;
+      Serial.println("[INFO] Attempting WiFi reconnect...");
+      
+      if (connectWiFi()) {
+        Serial.println("[OK] WiFi reconnected!");
+        ledBlink(2, 300);  // 2 slow blinks = reconnected
+      }
+    }
+  } else if (!wifi_was_connected) {
+    wifi_was_connected = true;
+    Serial.println("[OK] WiFi connection restored");
+    Serial.print("     IP: ");
+    Serial.println(WiFi.localIP());
+  }
+}
 
-# ─────────────────────────────────────────────
-# ESP32-CAM STREAM FETCHER
-# ─────────────────────────────────────────────
-def fetch_esp32_stream(cam_id, url):
-    global running, connected, frame_count, fps_stats
+// ==================== Setup ====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n");
+  Serial.println("========================================");
+  Serial.println("  XIAO ESP32S3 OV3660 Road Monitor");
+  Serial.println("========================================");
+  
+  // Initialize status LED
+  if (STATUS_LED_PIN >= 0) {
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    ledOff();
+  }
+  
+  // Configure watchdog
+  esp_task_wdt_deinit();                      // Clear any existing TWDT from bootloader
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+  
+  // Initialize camera
+  Serial.print("[INIT] Camera... ");
+  if (!initCamera()) {
+    Serial.println("FAILED!");
+    Serial.println("Check camera connections and restart.");
+    ledBlink(5, 150);  // 5 fast blinks = camera error
+    while (1) {
+      delay(1000);
+    }
+  }
+  Serial.println("OK");
+  
+  // Connect to WiFi
+  if (!connectWiFi()) {
+    Serial.println("[INFO] Starting AP mode as fallback...");
+    WiFi.softAP("XIAO_Camera", "12345678");
+    Serial.print("       AP IP: ");
+    Serial.println(WiFi.softAPIP());
+    ledBlink(1, 500);  // 1 long blink = AP mode
+  } else {
+    ledBlink(2, 200);  // 2 blinks = All OK
+  }
+  
+  // Setup web server routes
+  server.on("/", handleRoot);
+  server.on("/stream", handleStream);
+  server.on("/capture", handleCapture);
+  server.on("/status", handleStatus);
+  server.on("/restart", handleRestart);
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+  
+  Serial.println("----------------------------------------");
+  Serial.println("[READY] Server started");
+  Serial.println("----------------------------------------");
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("  Web UI:     http://");
+    Serial.println(WiFi.localIP());
+    Serial.print("  Stream URL: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/stream");
+    Serial.print("  Status:     http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/status");
+  } else {
+    Serial.print("  Web UI:     http://");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("  Stream URL: http://");
+    Serial.print(WiFi.softAPIP());
+    Serial.println("/stream");
+  }
+  Serial.println("----------------------------------------");
+  Serial.println("Waiting for Python server connection...");
+}
 
-    print(f"[{cam_id}] Connecting to {url}")
-    if not url.startswith('http'):
-        url = 'http://' + url
-    if not url.endswith('/stream'):
-        url = url.rstrip('/') + '/stream'
-
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    frame_times     = deque(maxlen=30)
-    reconnect_delay = 1
-
-    while running:
-        buffer          = b''
-        stream          = None
-        frame_count_local = 0
-
-        try:
-            req    = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            stream = urllib.request.urlopen(req, timeout=5, context=ctx)
-
-            print(f"[{cam_id}] Connected!")
-            connected[cam_id]  = True
-            reconnect_delay    = 1
-            buffer             = b''
-
-            while running:
-                try:
-                    chunk = stream.read(4096)
-                    if not chunk:
-                        break
-
-                    buffer += chunk
-                    if len(buffer) > 500000:
-                        buffer = buffer[-250000:]
-
-                    start = buffer.find(b'\xff\xd8')
-                    end   = buffer.find(b'\xff\xd9')
-
-                    if start != -1 and end != -1 and end > start:
-                        frame_start = time.time()
-                        jpeg_data   = buffer[start:end+2]
-                        buffer      = buffer[end+2:]
-
-                        img_array = np.frombuffer(jpeg_data, dtype=np.uint8)
-                        frame     = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-                        if frame is not None:
-                            frame_count_local += 1
-                            frame = cv2.resize(frame, (640, 480))
-
-                            try:
-                                processed = process_frame(frame, cam_id)
-                            except Exception as e:
-                                print(f"[{cam_id}] Process error: {e}")
-                                processed = frame
-
-                            _, buf = cv2.imencode('.jpg', processed,
-                                                  [cv2.IMWRITE_JPEG_QUALITY, 70])
-                            with lock:
-                                frames[cam_id]        = buf.tobytes()
-                                frame_count[cam_id]  += 1
-
-                            frame_time = time.time() - frame_start
-                            frame_times.append(frame_time)
-                            if len(frame_times) >= 10:
-                                fps_stats[cam_id] = int(len(frame_times)/sum(frame_times))
-
-                            if frame_count_local % 100 == 0:
-                                print(f"[{cam_id}] FPS: {fps_stats[cam_id]} | "
-                                      f"Frames: {frame_count_local}")
-                        else:
-                            buffer = b''
-
-                except socket.timeout:
-                    print(f"[{cam_id}] Socket timeout, reconnecting...")
-                    break
-                except Exception as e:
-                    print(f"[{cam_id}] Stream read error: {e}")
-                    break
-
-        except Exception as e:
-            print(f"[{cam_id}] Connection error: {e}")
-            connected[cam_id]  = False
-            reconnect_delay    = min(reconnect_delay * 2, 10)
-            time.sleep(reconnect_delay)
-        finally:
-            if stream:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-
-    connected[cam_id] = False
-    print(f"[{cam_id}] Stopped")
-
-
-# ─────────────────────────────────────────────
-# MJPEG STREAM GENERATOR
-# ─────────────────────────────────────────────
-def generate_frames(cam_id):
-    while True:
-        with lock:
-            frame_data = frames.get(cam_id)
-        if frame_data:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
-        else:
-            time.sleep(0.05)
-
-
-@app.route("/video/<cam_id>")
-def video(cam_id):
-    if cam_id not in ["CAM-1", "CAM-2"]:
-        return "Invalid camera ID", 400
-    response = Response(generate_frames(cam_id),
-                        mimetype="multipart/x-mixed-replace; boundary=frame")
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma']        = 'no-cache'
-    response.headers['Expires']       = '0'
-    return response
-
-
-# ─────────────────────────────────────────────
-# API ENDPOINTS
-# ─────────────────────────────────────────────
-@app.route("/api/start", methods=["POST"])
-def start():
-    global running
-    data    = request.json or {}
-    cam1    = data.get("cam1", "").strip()
-    cam2    = data.get("cam2", "").strip()
-    running = True
-    started = []
-    if cam1:
-        threading.Thread(target=fetch_esp32_stream, args=("CAM-1", cam1), daemon=True).start()
-        started.append("CAM-1")
-    if cam2:
-        threading.Thread(target=fetch_esp32_stream, args=("CAM-2", cam2), daemon=True).start()
-        started.append("CAM-2")
-    return jsonify({"started": started})
-
-
-@app.route("/api/stop", methods=["POST"])
-def stop():
-    global running
-    running = False
-    return jsonify({"status": "stopped"})
-
-
-@app.route("/api/status")
-def status():
-    return jsonify({
-        "CAM-1": {"connected": connected["CAM-1"], "frames": frame_count["CAM-1"]},
-        "CAM-2": {"connected": connected["CAM-2"], "frames": frame_count["CAM-2"]},
-    })
-
-
-@app.route("/api/log")
-def get_log():
-    with lock:
-        return jsonify(list(log[-500:]))
-
-
-@app.route("/api/log/clear", methods=["POST"])
-def clear_log():
-    with lock:
-        log.clear()
-    return jsonify({"status": "cleared"})
-
-
-@app.route("/api/snapshots")
-def list_snapshots():
-    try:
-        entries = sorted(os.listdir(SNAPSHOT_DIR), reverse=True)
-        folders = [e for e in entries
-                   if os.path.isdir(os.path.join(SNAPSHOT_DIR, e))]
-        return jsonify({"snapshots": folders})
-    except Exception as e:
-        return jsonify({"snapshots": [], "error": str(e)})
-
-
-@app.route("/api/snapshots/<folder>")
-def list_burst_frames(folder):
-    folder_path = os.path.join(SNAPSHOT_DIR, folder)
-    if not os.path.isdir(folder_path):
-        return jsonify({"error": "Not found"}), 404
-    files = sorted([f for f in os.listdir(folder_path) if f.endswith('.jpg')])
-    return jsonify({"folder": folder, "frames": files})
-
-
-@app.route("/api/metadata")
-def get_metadata():
-    try:
-        if os.path.exists(METADATA_FILE):
-            with open(METADATA_FILE, 'r') as f:
-                return jsonify(json.load(f))
-        return jsonify([])
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-
-@app.route("/api/scan")
-def scan():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        local_ip = "192.168.1.1"
-
-    subnet     = ".".join(local_ip.split(".")[:3])
-    candidates = [f"{subnet}.{i}" for i in range(1, 255)]
-
-    def probe(ip):
-        for port, path in [(81, "/stream"), (80, "/stream")]:
-            try:
-                s = socket.create_connection((ip, port), timeout=0.3)
-                s.close()
-                return f"http://{ip}:{port}{path}"
-            except OSError:
-                pass
-        return None
-
-    found = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as ex:
-        for url in ex.map(probe, candidates):
-            if url:
-                found.append(url)
-            if len(found) >= 2:
-                break
-
-    return jsonify({"cameras": found})
-
-
-# ─────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    import os as _os
-    port = int(_os.environ.get("PORT", 10000))
-    print("=" * 60)
-    print("ROAD SAFETY MONITOR - 5-FRAME BURST CAPTURE ON VIOLATION")
-    print("=" * 60)
-    print(f"[INFO] Server: http://0.0.0.0:{port}")
-    print(f"[INFO] Snapshots dir: ./{SNAPSHOT_DIR}/")
-    print(f"[INFO] Metadata file: {METADATA_FILE}")
-    print(f"[INFO] Device: {DEVICE.upper()}")
-    print(f"[INFO] Burst frames: {BURST_BEFORE} before + 1 current + {BURST_AFTER} after = {BURST_TOTAL}")
-    print(f"[INFO] Color Detection: {'ENABLED' if SKLEARN_AVAILABLE else 'LIMITED'}")
-    print(f"[INFO] OCR: {'ENABLED' if OCR_AVAILABLE else 'DISABLED'}")
-    print("=" * 60)
-    print("[INFO] Each violation creates a folder with 5 timestamped frames")
-    print("[INFO] Press Ctrl+C to stop")
-    print("=" * 60)
-    app.run(host="0.0.0.0", port=port, debug=False)
+// ==================== Main Loop ====================
+void loop() {
+  // Feed watchdog
+  esp_task_wdt_reset();
+  
+  // Handle web server clients
+  server.handleClient();
+  
+  // Check WiFi connection health
+  checkWiFi();
+  
+  // Small delay to prevent tight-looping
+  delay(5);
+}
