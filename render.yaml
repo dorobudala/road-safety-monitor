@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: road-safety-monitor
-    runtime: docker
-    plan: free
-    healthCheckPath: /
-    envVars:
-      - key: PORT
-        value: 10000
